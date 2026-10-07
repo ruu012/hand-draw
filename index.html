@@ -23,6 +23,7 @@
 <canvas id="view"></canvas>
 <video id="cam" playsinline muted></video>
 <div id="ui">
+  <button id="undo">回上一步</button>
   <button id="clear">清空</button>
   <button id="save">保存图片</button>
   <button id="modeLine" class="on">线条笔</button>
@@ -60,7 +61,10 @@ function redrawAll(){
   spreading = []; replaying = true;
   for (const s of strokes) {
     if (mode === 'pearl') placePearls(s.pts);
-    else for (const [x, y, f] of s.pts) stamp(x, y, f * baseR());
+    else for (const p of s.pts) {
+      if (p[3] === undefined) { p[3] = rnd(-1.1, 1.1); p[4] = rnd(-0.5, 0.5); }   // 珍珠笔画的笔迹第一次变线条时才补随机值
+      stamp(p[0], p[1], p[2] * baseR(), p[3], p[4]);
+    }
   }
   replaying = false;
   finishSpread();      // 立体笔：重画时扩散直接到位
@@ -107,17 +111,18 @@ addEventListener('resize', resize); resize();
 
 const rnd = (a,b)=>a+Math.random()*(b-a);
 
-function stamp(x, y, R){
-  if (!replaying && curStroke && mode !== 'pearl') curStroke.pts.push([x, y, R / baseR()]);   // 记下笔迹，换笔刷时重画
+function stamp(x, y, R, jr = rnd(-1.1, 1.1), jw = rnd(-0.5, 0.5)){
+  // 记下笔迹(含毛边的随机值)，换笔刷或回上一步时按原样重画，边缘不会变样
+  if (!replaying && curStroke && mode !== 'pearl') curStroke.pts.push([x, y, R / baseR(), jr, jw]);
   if (R < 0.4) return;
   const j = Math.min(1, R / 5);              // 笔尖越细，毛边抖动越小
-  const r = R + rnd(-1.1, 1.1) * j;
+  const r = R + jr * j;
   const ol = mode === 'solid' ? SOLID_OL : OUTLINE;
   if (mode === 'solid') markDirty(x, y, r + 16);
   PC.fillStyle = PINK;
   PC.beginPath(); PC.arc(x, y, Math.max(0.3, r), 0, Math.PI*2); PC.fill();
   // 白色：缩小一圈挖空；笔尖太细时只剩粉色实心尖
-  const wr = R - ol + rnd(-0.5, 0.5) * j;
+  const wr = R - ol + jw * j;
   if (wr > 0.4) {
     WC.fillStyle = '#fff';
     WC.beginPath(); WC.arc(x, y, wr, 0, Math.PI*2); WC.fill();
@@ -149,19 +154,21 @@ function spreadStep(final){
 const stepSpread = () => spreadStep(false);
 const finishSpread = () => spreadStep(true);
 
-// ---------- 撤销 (Ctrl+Z) ----------
-const history = [];function withStrokes(a){ a.strokes = strokes.slice(); return a; }
+// ---------- 回上一步（按钮或 Ctrl+Z，可以一直往回退）----------
+// 只存“每一笔的笔迹清单”，不存整张图，所以占的记忆体很小，可以退很多步。
+const history = [];
 function snapshot(){
   finishSpread();
-  history.push(withStrokes([pinkL, whiteL, pearlL, pink3, white3].map(c => { const s = document.createElement('canvas'); s.width = c.width; s.height = c.height; s.getContext('2d').drawImage(c,0,0); return s; })));
-  if (history.length > 30) history.shift();
+  history.push(strokes.slice());           // 动作开始前的笔迹清单
+  if (history.length > 1000) history.shift();
 }
 function undo(){
   const h = history.pop(); if (!h) return;
-  strokes = h.strokes; curStroke = null;
-  last = null; spreading = [];
-  [[pctx,pinkL],[wctx,whiteL],[prctx,pearlL],[p3ctx,pink3],[w3ctx,white3]].forEach(([g,c],i)=>{ g.clearRect(0,0,c.width,c.height); g.drawImage(h[i],0,0); }); markAll();
+  endStroke();
+  strokes = h; curStroke = null; last = null; spreading = [];
+  redrawAll();                             // 用笔迹清单把画面重画一遍
 }
+document.getElementById('undo').onclick = undo;
 addEventListener('keydown', e=>{ if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); } });
 
 // ---------- 珍珠笔 ----------
