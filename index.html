@@ -1,0 +1,547 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>手势镂空画笔</title>
+<style>
+  html,body{margin:0;height:100%;background:#fff;overflow:hidden;font-family:system-ui,"Microsoft YaHei",sans-serif;color:#b46ac8}
+  canvas#view{position:fixed;inset:0;width:100%;height:100%}
+  #cam{position:fixed;left:-9999px;top:0;width:320px;opacity:0;pointer-events:none}
+  #camOld{position:fixed;right:14px;bottom:14px;width:200px;border-radius:10px;opacity:.55;transform:scaleX(-1);border:1px solid #ecc9f6}
+  #ui{position:fixed;left:14px;top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  button{border:1px solid #e4b4f2;background:#fff;color:#b46ac8;border-radius:999px;padding:6px 14px;cursor:pointer;font-size:14px}
+  button:hover{background:#faeefd}
+  label{white-space:nowrap;font-size:13px;display:flex;align-items:center;gap:6px}
+  button.on{background:#ffb9e3;color:#fff;border-color:#ffb9e3}
+  .num{width:52px;border:1px solid #e4b4f2;border-radius:6px;padding:2px 4px;color:#b46ac8;font-size:13px}
+  #pearlCtl{display:flex;align-items:center}
+  #status{position:fixed;left:14px;bottom:14px;font-size:13px;background:#fff;padding:4px 10px;border-radius:999px}
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="ui">
+  <button id="clear">清空</button>
+  <button id="save">保存图片</button>
+  <button id="modeLine" class="on">线条笔</button>
+  <button id="modePearl">珍珠笔</button>
+  <button id="modeSolid">立体笔</button>
+  <button id="bgToggle">白色画布</button>
+</div>
+<div id="status">正在加载手势识别…</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script>
+const PINK = '#FFB9E3';      // 轮廓颜色
+const OUTLINE = 2.5;          // 轮廓线粗细(px)
+const view = document.getElementById('view');
+const vctx = view.getContext('2d');
+const video = document.getElementById('cam');
+const statusEl = document.getElementById('status');
+const LINE_R = 3.5, PEARL_S = 10, PEARL_B = 20;   // 固定值：线条笔粗 / 小珍珠直径 / 大珍珠直径
+const SOLID_R = 2.8, SOLID_OL = 1.4;              // 立体笔：笔粗 / 轮廓粗细
+const SPREAD = 1.3, SPREAD_MS = 450;              // 泥巴扩散：向外多晕开的像素 / 晕开时长(之后就停住)
+let mode = 'line';
+
+function setMode(m){
+  endStroke(); mode = m;
+  document.getElementById('modeLine').classList.toggle('on', m==='line');
+  document.getElementById('modePearl').classList.toggle('on', m==='pearl');
+  document.getElementById('modeSolid').classList.toggle('on', m==='solid');
+  PC = m==='solid' ? p3ctx : pctx; WC = m==='solid' ? w3ctx : wctx;
+  redrawAll();
+}
+// 换笔刷：清掉画面，用记下的笔迹把每一笔都用新笔刷重画
+function redrawAll(){
+  for (const [g, cv] of [[pctx,pinkL],[wctx,whiteL],[prctx,pearlL],[p3ctx,pink3],[w3ctx,white3]]) g.clearRect(0, 0, cv.width, cv.height);
+  spreading = []; replaying = true;
+  for (const s of strokes) {
+    if (mode === 'pearl') placePearls(s.pts);
+    else for (const [x, y, f] of s.pts) stamp(x, y, f * baseR());
+  }
+  replaying = false;
+  finishSpread();      // 立体笔：重画时扩散直接到位
+  markAll();
+}
+document.getElementById('modeLine').onclick = ()=>setMode('line');
+document.getElementById('modePearl').onclick = ()=>setMode('pearl');
+document.getElementById('modeSolid').onclick = ()=>setMode('solid');
+
+// 两层：粉色层(外轮廓) + 白色层(镂空内部)。先画满所有粉色，再叠所有白色，
+// 所以笔画重叠处内部自动融合成白色，只剩最外圈是粉色轮廓。
+const glc = document.createElement('canvas');      // 背景：镜头画面做成半色调(WebGL)
+const pinkL = document.createElement('canvas');
+const whiteL = document.createElement('canvas');
+const pctx = pinkL.getContext('2d');
+const wctx = whiteL.getContext('2d');
+const pearlL = document.createElement('canvas');   // 珍珠层(在线条之上)
+const prctx = pearlL.getContext('2d');
+// 立体笔：自己的粉色层/白色层，渲染时再加明暗，结果缓存在 out3
+const pink3 = document.createElement('canvas'), white3 = document.createElement('canvas');
+const p3ctx = pink3.getContext('2d'), w3ctx = white3.getContext('2d');
+const ring3 = document.createElement('canvas'), tmp3 = document.createElement('canvas'), out3 = document.createElement('canvas');
+const rctx = ring3.getContext('2d'), tctx = tmp3.getContext('2d'), octx = out3.getContext('2d');
+let PC = pctx, WC = wctx, dirty3 = false, dr = null;   // dr：立体笔需要重算的范围
+function markDirty(x, y, r){
+  dirty3 = true; if (dr === 'all') return;
+  if (!dr) dr = { x0: x - r, y0: y - r, x1: x + r, y1: y + r };
+  else { dr.x0 = Math.min(dr.x0, x - r); dr.y0 = Math.min(dr.y0, y - r); dr.x1 = Math.max(dr.x1, x + r); dr.y1 = Math.max(dr.y1, y + r); }
+}
+function markAll(){ dirty3 = true; dr = 'all'; }
+
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  for (const c of [view, pinkL, whiteL, pearlL, pink3, white3, ring3, tmp3, out3]) {
+    const old = document.createElement('canvas');
+    old.width = c.width; old.height = c.height;
+    if (c.width) old.getContext('2d').drawImage(c, 0, 0);
+    c.width = w; c.height = h;
+    if (old.width) c.getContext('2d').drawImage(old, 0, 0);
+  }
+  glc.width = w; glc.height = h;
+}
+addEventListener('resize', resize); resize();
+
+const rnd = (a,b)=>a+Math.random()*(b-a);
+
+function stamp(x, y, R){
+  if (!replaying && curStroke && mode !== 'pearl') curStroke.pts.push([x, y, R / baseR()]);   // 记下笔迹，换笔刷时重画
+  if (R < 0.4) return;
+  const j = Math.min(1, R / 5);              // 笔尖越细，毛边抖动越小
+  const r = R + rnd(-1.1, 1.1) * j;
+  const ol = mode === 'solid' ? SOLID_OL : OUTLINE;
+  if (mode === 'solid') markDirty(x, y, r + 16);
+  PC.fillStyle = PINK;
+  PC.beginPath(); PC.arc(x, y, Math.max(0.3, r), 0, Math.PI*2); PC.fill();
+  // 白色：缩小一圈挖空；笔尖太细时只剩粉色实心尖
+  const wr = R - ol + rnd(-0.5, 0.5) * j;
+  if (wr > 0.4) {
+    WC.fillStyle = '#fff';
+    WC.beginPath(); WC.arc(x, y, wr, 0, Math.PI*2); WC.fill();
+  }
+  // 立体笔：边画边扩散。记下这一点，之后几帧里粉色和白色一起慢慢变大
+  if (mode === 'solid') spreading.push({ x, y, rp: Math.max(0.3, r), wr: wr > 0.4 ? wr : 0, t0: stampT ?? performance.now() });
+}
+
+// 泥巴扩散：每个点画下去之后，粉色外圈和中空的白色“一起”往外晕开 SPREAD 像素，然后定住。
+// 两者同时变大，所以粉色线条本身的粗细不变。
+// 每一笔的笔迹(位置 + 相对粗细)：换笔刷时用它把整张图用新笔刷重画
+let strokes = [], curStroke = null, replaying = false;
+const startStroke = () => { curStroke = { pts: [] }; strokes.push(curStroke); };
+let spreading = [];
+function spreadStep(final){
+  if (!spreading.length) return;
+  const now = performance.now();
+  p3ctx.fillStyle = PINK; w3ctx.fillStyle = '#fff';
+  for (const s of spreading) {
+    const t = final ? 1 : Math.min(1, (now - s.t0) / SPREAD_MS);
+    const d = SPREAD * (1 - Math.pow(1 - t, 3));          // 先快后慢
+    p3ctx.beginPath(); p3ctx.arc(s.x, s.y, s.rp + d, 0, Math.PI*2); p3ctx.fill();
+    if (s.wr > 0) { w3ctx.beginPath(); w3ctx.arc(s.x, s.y, s.wr + d, 0, Math.PI*2); w3ctx.fill(); }
+    s.done = t >= 1;
+    markDirty(s.x, s.y, s.rp + d + 16);
+  }
+  spreading = spreading.filter(s => !s.done);
+}
+const stepSpread = () => spreadStep(false);
+const finishSpread = () => spreadStep(true);
+
+// ---------- 撤销 (Ctrl+Z) ----------
+const history = [];function withStrokes(a){ a.strokes = strokes.slice(); return a; }
+function snapshot(){
+  finishSpread();
+  history.push(withStrokes([pinkL, whiteL, pearlL, pink3, white3].map(c => { const s = document.createElement('canvas'); s.width = c.width; s.height = c.height; s.getContext('2d').drawImage(c,0,0); return s; })));
+  if (history.length > 30) history.shift();
+}
+function undo(){
+  const h = history.pop(); if (!h) return;
+  strokes = h.strokes; curStroke = null;
+  last = null; spreading = [];
+  [[pctx,pinkL],[wctx,whiteL],[prctx,pearlL],[p3ctx,pink3],[w3ctx,white3]].forEach(([g,c],i)=>{ g.clearRect(0,0,c.width,c.height); g.drawImage(h[i],0,0); }); markAll();
+}
+addEventListener('keydown', e=>{ if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); } });
+
+// ---------- 珍珠笔 ----------
+// 抠图：用图片里的珍珠（去掉近白背景，保留圆形珍珠）；失败则用渐层画一颗
+const pearlImg = document.createElement('canvas');
+(function buildPearl(){
+  const S = 128; pearlImg.width = pearlImg.height = S;
+  const g = pearlImg.getContext('2d');
+  function fallback(){
+    g.clearRect(0,0,S,S);
+    const gr = g.createRadialGradient(S*.4,S*.35,S*.04,S*.5,S*.5,S*.5);
+    gr.addColorStop(0,'#fff'); gr.addColorStop(.45,'#f1eeee'); gr.addColorStop(1,'#c9c6c6');
+    g.fillStyle = gr; g.beginPath(); g.arc(S/2,S/2,S/2-1,0,Math.PI*2); g.fill();
+  }
+  fallback();
+  const img = new Image();
+  img.onload = ()=>{
+    try {
+      const t = document.createElement('canvas'); t.width = img.width; t.height = img.height;
+      const tg = t.getContext('2d'); tg.drawImage(img,0,0);
+      // 珍珠在原图(2000x1414)中的位置：圆心(555.5, 855)，半径约 75.5；按比例换算，不需要读像素
+      const k = img.width / 2000;
+      let cx = 555.5*k, cy = 855*k, R = 75.5*k;
+      try {   // 能读像素时(用 localhost 打开)再精确校正
+        const d = tg.getImageData(0,0,t.width,t.height).data;
+        let x0=1e9,y0=1e9,x1=-1,y1=-1;
+        for (let y=0;y<t.height;y++) for (let x=0;x<t.width;x++){
+          const i=(y*t.width+x)*4;
+          if (Math.min(d[i],d[i+1],d[i+2]) < 236){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+        }
+        if (x1>0 && (x1-x0) < 400*k) { cx=(x0+x1)/2; cy=(y0+y1)/2; R=Math.max(x1-x0,y1-y0)/2; }
+      } catch(e) {}
+      g.clearRect(0,0,S,S);
+      g.save(); g.beginPath(); g.arc(S/2,S/2,S/2-1,0,Math.PI*2); g.clip();   // 圆形去背
+      g.drawImage(t, cx-R, cy-R, R*2, R*2, 0, 0, S, S);
+      g.restore();
+    } catch(e) { fallback(); }
+  };
+  img.src = 'pearl-src.webp';
+})();
+
+// 顺序：4 颗小珍珠 + 1 颗大珍珠，循环
+let pIdx = 0, pSince = 0, pLastR = 0;
+const pearlR = i => (i % 5 === 4 ? PEARL_B : PEARL_S) / 2;
+function drawPearl(x, y, r){ prctx.drawImage(pearlImg, x-r, y-r, r*2, r*2); }
+function pearlTo(x, y){
+  if (!last) { snapshot(); startStroke(); last = {x, y}; len = 0; pIdx = 0; pSince = 0; pLastR = pearlR(0); drawPearl(x, y, pLastR); curStroke.pts.push([x, y, taper(0)]); return; }
+  const dx = x-last.x, dy = y-last.y, d = Math.hypot(dx, dy);
+  if (d < 0.5) return;
+  const step = 1;
+  for (let t = step; t <= d; t += step) {
+    const px = last.x + dx*t/d, py = last.y + dy*t/d;
+    len += step;
+    curStroke.pts.push([px, py, taper(len)]);   // 记下笔迹，换成线条笔时用
+    pSince += step;
+    const nr = pearlR(pIdx + 1);
+    if (pSince >= pLastR + nr + 0.5) {
+      pIdx++; pSince = 0; pLastR = nr;
+      drawPearl(px, py, nr);
+    }
+  }
+  last = {x, y};
+}
+// 用记下的笔迹摆珍珠（换笔刷重画时用）
+function placePearls(pts){
+  if (!pts.length) return;
+  pIdx = 0; pSince = 0; pLastR = pearlR(0);
+  drawPearl(pts[0][0], pts[0][1], pLastR);
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i-1], b = pts[i];
+    const d = Math.hypot(b[0]-a[0], b[1]-a[1]);
+    const n = Math.max(1, Math.ceil(d));
+    for (let k = 1; k <= n; k++) {
+      pSince += d / n;
+      const nr = pearlR(pIdx + 1);
+      if (pSince >= pLastR + nr + 0.5) {
+        pIdx++; pSince = 0; pLastR = nr;
+        drawPearl(a[0] + (b[0]-a[0])*k/n, a[1] + (b[1]-a[1])*k/n, nr);
+      }
+    }
+  }
+}
+// 起笔锥化：从很细渐变到全宽
+const baseR = () => mode === 'solid' ? SOLID_R : LINE_R;
+const headLen = () => 8 + baseR() * 1.2;
+const taper = l => Math.min(1, 0.08 + 0.92 * (l / headLen()));
+
+let last = null, mid = null, lastT = 0, len = 0, curW = 0, dir = {x:0, y:0};
+// 画一段二次贝塞尔曲线（mid → m，控制点是上一个采样点 last）：
+// 就算手移动很快、两次采样隔很远，也会连成圆滑的曲线，而不是一节一节的折线。
+// 粗细在这一段里平滑过渡，扩散的起始时间也按位置错开，所以不会一段一段地同时变化。
+function curveSeg(P0, C, P1, w0, w1, t0, t1){
+  const L = (Math.hypot(C.x-P0.x, C.y-P0.y) + Math.hypot(P1.x-C.x, P1.y-C.y) + Math.hypot(P1.x-P0.x, P1.y-P0.y)) / 2;
+  const n = Math.max(1, Math.ceil(L / 1.4));
+  for (let i = 1; i <= n; i++) {
+    const u = i / n, v = 1 - u;
+    const x = v*v*P0.x + 2*v*u*C.x + u*u*P1.x, y = v*v*P0.y + 2*v*u*C.y + u*u*P1.y;
+    stampT = t0 + (t1 - t0) * u;
+    stamp(x, y, (w0 + (w1 - w0) * u) * taper(len + L * u));
+  }
+  stampT = null;
+  len += L;
+}
+let stampT = null;
+function strokeTo(x, y){
+  if (mode === 'pearl') return pearlTo(x, y);
+  const base = baseR(), now = performance.now();
+  if (!last) { snapshot(); startStroke(); last = {x, y}; mid = {x, y}; lastT = now; len = 0; curW = base; dir = {x:0, y:0}; stamp(x, y, base * taper(0)); return; }
+  const dx = x-last.x, dy = y-last.y, d = Math.hypot(dx, dy);
+  if (d < 0.5) return;
+  // 速度越快越粗（平滑过渡，像水彩笔压出来）
+  const w0 = curW;
+  curW += (base * (1 + Math.min(d / 20, 1) * 0.9) - curW) * 0.2;
+  const m = { x: (last.x + x) / 2, y: (last.y + y) / 2 };
+  curveSeg(mid, last, m, w0, curW, lastT, now);
+  dir = { x: dir.x*0.5 + dx/d*0.5, y: dir.y*0.5 + dy/d*0.5 };
+  mid = m; last = {x, y}; lastT = now;
+}
+// 收笔：先把曲线接到最后一个点，再顺着笔势延伸一小段并渐渐变尖
+function endStroke(){
+  if (mode !== 'pearl' && last && mid) {
+    curveSeg(mid, last, last, curW, curW, lastT, performance.now());
+    if (len > 4) {
+      const m = Math.hypot(dir.x, dir.y) || 1;
+      const ux = dir.x/m, uy = dir.y/m;
+      const T = Math.max(6, Math.min(16, curW * 2));
+      const r0 = curW * taper(len);
+      for (let t = 1.6; t < T; t += 1.6) {
+        const k = 1 - t/T;
+        stamp(last.x + ux*t, last.y + uy*t, r0 * k * k * 0.6 + r0 * k * 0.4);
+      }
+    }
+  }
+  if (mode === 'pearl' && curStroke) {   // 珍珠笔收笔的笔迹也收尖，换成线条笔时才有尖尾
+    const P = curStroke.pts, N = Math.min(12, P.length);
+    for (let i = 0; i < N; i++) P[P.length - 1 - i][2] *= (i + 1) / (N + 1);
+  }
+  curStroke = null;
+  last = null; mid = null;
+}
+// ---------- 立体笔渲染：整条线(粉色轮廓+中空)当成一根有厚度的管子 ----------
+// 不画落在画布上的投影，阴影/高光只在线条自己身上。
+// edge：取 mask 中“没被平移后的 mask 盖住”的那一圈边，染色、模糊后累加到 ring3
+// 只重算这次变动的一小块(RG)，不是整张画布，所以画立体笔不会卡
+let RG = { x0: 0, y0: 0, w: 0, h: 0 };
+const src = (g, img, ox = 0, oy = 0) => g.drawImage(img, RG.x0 - ox, RG.y0 - oy, RG.w, RG.h, RG.x0, RG.y0, RG.w, RG.h);
+function edge(mask, dx, dy, color, blur){
+  tctx.globalCompositeOperation = 'source-over';
+  tctx.clearRect(RG.x0, RG.y0, RG.w, RG.h);
+  src(tctx, mask);
+  tctx.globalCompositeOperation = 'destination-out';
+  src(tctx, mask, dx, dy);
+  tctx.globalCompositeOperation = 'source-in';
+  tctx.fillStyle = color; tctx.fillRect(RG.x0, RG.y0, RG.w, RG.h);
+  tctx.globalCompositeOperation = 'source-over';
+  rctx.filter = 'blur(' + blur + 'px)';
+  src(rctx, tmp3);
+  rctx.filter = 'none';
+}
+function build3D(){
+  const W = out3.width, H = out3.height;
+  const r = (dr === 'all' || !dr) ? { x0: 0, y0: 0, x1: W, y1: H } : dr;
+  dr = null;
+  const x0 = Math.max(0, Math.floor(r.x0)), y0 = Math.max(0, Math.floor(r.y0));
+  const x1 = Math.min(W, Math.ceil(r.x1)), y1 = Math.min(H, Math.ceil(r.y1));
+  if (x1 <= x0 || y1 <= y0) return;
+  RG = { x0, y0, w: x1 - x0, h: y1 - y0 };
+  octx.clearRect(x0, y0, RG.w, RG.h);
+  src(octx, pink3);          // 粉色外圈
+  src(octx, white3);         // 中空：纯白，是整条线最凸的地方
+  rctx.globalCompositeOperation = 'source-over';
+  rctx.clearRect(x0, y0, RG.w, RG.h);
+  // 1) 越靠外缘越往下倾：整圈外缘压暗，像一根中间鼓起来的管子
+  tctx.globalCompositeOperation = 'source-over';
+  tctx.clearRect(x0, y0, RG.w, RG.h);
+  tctx.fillStyle = 'rgba(205,70,155,.6)'; tctx.fillRect(x0, y0, RG.w, RG.h);
+  tctx.globalCompositeOperation = 'destination-out';
+  tctx.filter = 'blur(2.4px)'; src(tctx, pink3); tctx.filter = 'none';
+  tctx.globalCompositeOperation = 'source-over';
+  src(rctx, tmp3);
+  // 2) 受光方向：光从上往下照，上缘亮、下缘暗
+  edge(pink3, 0,  3, 'rgba(255,255,255,.75)', 1.6);
+  edge(pink3, 0, -3, 'rgba(190,50,140,.6)', 1.6);
+  // 只落在粉色外圈上：中空保持纯白；也不溢出到画布
+  rctx.globalCompositeOperation = 'destination-in';
+  src(rctx, pink3);
+  rctx.globalCompositeOperation = 'destination-out';
+  src(rctx, white3);
+  rctx.globalCompositeOperation = 'source-over';
+  src(octx, ring3);
+  // 3) 白色鼓起处也要阴影：光从上往下，下半部带一点淡粉灰的暗部，上缘保持亮
+  rctx.clearRect(x0, y0, RG.w, RG.h);
+  edge(white3, 0, -4, 'rgba(225,150,205,.55)', 2);
+  rctx.globalCompositeOperation = 'destination-in';
+  src(rctx, white3);
+  rctx.globalCompositeOperation = 'source-over';
+  src(octx, ring3);
+}
+// ---------- 渲染 ----------
+let cursor = null; // {x,y,down}
+function render(){
+  vctx.clearRect(0,0,view.width,view.height);
+  paintBG(vctx);
+  vctx.drawImage(pinkL, 0, 0);
+  vctx.drawImage(whiteL, 0, 0);
+  stepSpread();
+  if (dirty3) { build3D(); dirty3 = false; }
+  vctx.drawImage(out3, 0, 0);
+  vctx.drawImage(pearlL, 0, 0);
+  if (cursor) {
+    vctx.beginPath(); vctx.arc(cursor.x, cursor.y, cursor.down ? 5 : 10, 0, Math.PI*2);
+    vctx.strokeStyle = '#d98ae8'; vctx.lineWidth = 2; vctx.stroke();
+    if (cursor.down) { vctx.fillStyle = '#d98ae8'; vctx.fill(); }
+  }
+  requestAnimationFrame(render);
+}
+
+// ---------- 背景：镜头画面 → 半色调 ----------
+const HALF_COLOR = [0xC2/255, 0xE4/255, 0x6C/255], CELL = 5;   // CELL：网点间距，越小越细
+// 镜头画面铺满画布(裁掉多出的部分)，并左右镜像；手的位置也用同一个换算，所以笔会对准手
+function coverTransform(){
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(view.width / vw, view.height / vh);
+  const dw = vw * s, dh = vh * s;
+  return { dw, dh, ox: (view.width - dw) / 2, oy: (view.height - dh) / 2 };
+}
+// 半色调交给显卡(WebGL)算：每个像素自己判断落在哪个网点、点多大，所以很流畅
+const gl = glc.getContext('webgl', { preserveDrawingBuffer: true, antialias: false });
+let glProg = null, glTex = null, glU = {}, lastVT = -1, lvLo = 0.05, lvHi = 0.95;
+if (gl) {
+  const mk = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  glProg = gl.createProgram();
+  gl.attachShader(glProg, mk(gl.VERTEX_SHADER, 'attribute vec2 a; void main(){ gl_Position = vec4(a, 0., 1.); }'));
+  gl.attachShader(glProg, mk(gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    uniform sampler2D tex; uniform vec2 res, lohi; uniform vec4 cover; uniform float cell, hasVideo; uniform vec3 col;
+    float L(vec2 uv){ return dot(texture2D(tex, uv).rgb, vec3(.299, .587, .114)); }
+    void main(){
+      vec2 p = vec2(gl_FragCoord.x, res.y - gl_FragCoord.y), c0 = res * .5, d = p - c0;
+      const float k = .70710678;
+      vec2 q = vec2(k*d.x + k*d.y, -k*d.x + k*d.y);              // 转 45° 排成斜网格
+      vec2 cq = (floor(q / cell) + .5) * cell;                     // 这个网点的中心
+      vec2 cs = c0 + vec2(k*cq.x - k*cq.y, k*cq.x + k*cq.y);
+      float lum = 1.;
+      if (hasVideo > .5) {
+        vec2 uv = vec2(1. - (cs.x - cover.x) / cover.z, (cs.y - cover.y) / cover.w);
+        vec2 o = vec2(cell * .35) / cover.zw;
+        lum = (L(uv + vec2(o.x, o.y)) + L(uv + vec2(-o.x, o.y)) + L(uv + vec2(o.x, -o.y)) + L(uv + vec2(-o.x, -o.y))) * .25;
+      }
+      float t = clamp((lum - lohi.x) / (lohi.y - lohi.x), 0., 1.);   // 自动拉开对比
+      float r = cell * .78 * sqrt(pow(1. - t, .9));                  // 越暗点越大
+      float a = 1. - smoothstep(r - .7, r + .7, length(q - cq));
+      gl_FragColor = vec4(mix(vec3(1.), col, a), 1.);
+    }`));
+  gl.linkProgram(glProg); gl.useProgram(glProg);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(glProg, 'a'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  for (const n of ['tex','res','lohi','cover','cell','hasVideo','col']) glU[n] = gl.getUniformLocation(glProg, n);
+  glTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, glTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+}
+// 自动对比：每 0.4 秒缩成小图量一次最暗/最亮，慢慢靠过去（五官和轮廓更清楚）
+const lvC = document.createElement('canvas'); lvC.width = 32; lvC.height = 18;
+const lvX = lvC.getContext('2d', { willReadFrequently: true });
+setInterval(() => {
+  if (video.readyState < 2 || !video.videoWidth) return;
+  try {
+    lvX.drawImage(video, 0, 0, 32, 18);
+    const d = lvX.getImageData(0, 0, 32, 18).data, a = [];
+    for (let i = 0; i < d.length; i += 4) a.push((0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]) / 255);
+    a.sort((x, y) => x - y);
+    const lo = a[Math.floor(a.length * 0.04)], hi = a[Math.floor(a.length * 0.96)];
+    lvLo += (lo - lvLo) * 0.4; lvHi += (Math.max(hi, lo + 0.15) - lvHi) * 0.4;
+  } catch (e) {}
+}, 400);
+// 背景开关：镜头半色调 ↔ 纯白画布
+let whiteBG = false;
+document.getElementById('bgToggle').onclick = e => {
+  whiteBG = !whiteBG;
+  e.target.textContent = whiteBG ? '镜头画布' : '白色画布';
+  e.target.classList.toggle('on', whiteBG);
+};
+function paintBG(g){
+  if (whiteBG || !gl) { g.fillStyle = '#fff'; g.fillRect(0, 0, view.width, view.height); return; }
+  drawBG(); g.drawImage(glc, 0, 0);
+}
+function drawBG(){
+  if (!gl) return;
+  const hv = video.readyState >= 2 && video.videoWidth > 0;
+  gl.viewport(0, 0, glc.width, glc.height);
+  if (hv && video.currentTime !== lastVT) {   // 镜头出新画面才更新贴图
+    lastVT = video.currentTime;
+    gl.bindTexture(gl.TEXTURE_2D, glTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  }
+  const T = coverTransform();
+  gl.uniform1i(glU.tex, 0); gl.uniform2f(glU.res, glc.width, glc.height); gl.uniform2f(glU.lohi, lvLo, lvHi);
+  gl.uniform4f(glU.cover, T.ox, T.oy, T.dw, T.dh); gl.uniform1f(glU.cell, CELL);
+  gl.uniform1f(glU.hasVideo, hv ? 1 : 0); gl.uniform3f(glU.col, HALF_COLOR[0], HALF_COLOR[1], HALF_COLOR[2]);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+render();   // 背景准备好之后才开始每帧渲染
+
+// ---------- 手势 ----------
+let sm = null, pinching = false;
+function onResults(res){
+  const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
+  if (!lm) { cursor = null; if (pinching) { pinching = false; endStroke(); } sm = null; return; }
+  const thumb = lm[4], index = lm[8], palm = Math.hypot(lm[0].x-lm[9].x, lm[0].y-lm[9].y);
+  const dist = Math.hypot(thumb.x-index.x, thumb.y-index.y) / palm;
+  // 滞回：<0.28 开始捏合，>0.45 才松开，避免抖动断笔
+  if (!pinching && dist < 0.28) { pinching = true; sm = null; }
+  else if (pinching && dist > 0.45) { pinching = false; endStroke(); }
+
+  // 捏合点，画面镜像
+  const T = coverTransform();
+  const rx = T.ox + (1 - (thumb.x+index.x)/2) * T.dw;
+  const ry = T.oy + ((thumb.y+index.y)/2) * T.dh;
+  const k = 0.45; // 平滑
+  sm = sm ? { x: sm.x + (rx-sm.x)*k, y: sm.y + (ry-sm.y)*k } : { x: rx, y: ry };
+  cursor = { x: sm.x, y: sm.y, down: pinching };
+  if (pinching) strokeTo(sm.x, sm.y);
+}
+
+async function init(){
+  try {
+    const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+    hands.onResults(onResults);
+    const cam = new Camera(video, { onFrame: async()=>{ await hands.send({image: video}); }, width: 640, height: 480 });
+    await cam.start();
+    statusEl.textContent = '食指和拇指捏合开始画画，松开停笔（也可用鼠标）';
+  } catch (e) {
+    statusEl.textContent = '无法打开摄像头，已切换为鼠标模式：' + e.message;
+  }
+}
+init();
+
+// ---------- 鼠标备用 ----------
+let mdown = false;
+view.addEventListener('pointerdown', e=>{ mdown = true; strokeTo(e.clientX, e.clientY); });
+view.addEventListener('pointermove', e=>{ if (mdown) strokeTo(e.clientX, e.clientY); });
+addEventListener('pointerup', ()=>{ mdown = false; endStroke(); });
+
+// ---------- 按钮 ----------
+document.getElementById('clear').onclick = ()=>{ snapshot(); strokes = []; pctx.clearRect(0,0,pinkL.width,pinkL.height); wctx.clearRect(0,0,whiteL.width,whiteL.height); prctx.clearRect(0,0,pearlL.width,pearlL.height); p3ctx.clearRect(0,0,pink3.width,pink3.height); w3ctx.clearRect(0,0,white3.width,white3.height); markAll(); };
+document.getElementById('save').onclick = ()=>{
+  const c = document.createElement('canvas'); c.width = view.width; c.height = view.height;
+  const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0,0,c.width,c.height);
+  paintBG(x); x.drawImage(pinkL,0,0); x.drawImage(whiteL,0,0); if (dirty3) { build3D(); dirty3 = false; } x.drawImage(out3,0,0); x.drawImage(pearlL,0,0);
+  c.toBlob(async blob => {
+    try {   // 优先存进文件夹：由 server.ps1 写进 saved/
+      const r = await fetch('/save', { method: 'POST', body: blob });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      statusEl.textContent = '已保存到资料夹：saved/' + j.name;
+    } catch (e) {   // 没开服务器(直接双击打开网页)时，退回浏览器下载
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'drawing-' + Date.now() + '.png'; a.click();
+      statusEl.textContent = location.hostname === 'localhost'
+        ? '没有连到本机服务器，已改为浏览器下载'
+        : '已下载图片（在浏览器的下载资料夹里）';
+    }
+  }, 'image/png');
+};
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
